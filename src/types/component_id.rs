@@ -10,6 +10,10 @@ impl ComponentId {
         Self { id }
     }
 
+    pub fn from_type<TComponent: 'static>() -> Self {
+        Self { id: TypeId::of::<TComponent>() }
+    }
+
     pub fn id(&self) -> TypeId {
         self.id
     }

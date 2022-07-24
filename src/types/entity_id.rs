@@ -1,31 +1,31 @@
 use std::ops::Deref;
 
 
-#[derive(Debug, Clone, PartialEq, Hash, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Hash, Eq)]
 pub struct EntityId {
-    pub (crate) id: u32,
-    pub (crate) version: u32,
+    pub (crate) id: usize,
+    pub (crate) version: usize,
 }
 
 impl EntityId {
-    pub fn new(id: u32) -> Self {
+    pub fn new(id: usize) -> Self {
         Self {
             id,
             version: 0,
         }
     }
 
-    pub fn id(&self) -> u32 {
+    pub fn id(&self) -> usize {
         self.id
     }
 
-    pub fn version(&self) -> u32 {
+    pub fn version(&self) -> usize {
         self.version
     }
 }
 
 impl Deref for EntityId {
-    type Target = u32;
+    type Target = usize;
 
     fn deref(&self) -> &Self::Target {
         &self.id

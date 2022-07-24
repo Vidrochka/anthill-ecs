@@ -1,110 +1,197 @@
-use std::{any::Any, fmt::Debug, collections::HashMap, iter::Enumerate};
+use std::{any::Any, fmt::Debug, collections::HashMap, iter::Enumerate, ops::Add, sync::Arc, slice::Iter};
 
-use tokio::sync::{RwLock, RwLockWriteGuard, RwLockReadGuard};
+use tokio::sync::{RwLock, RwLockWriteGuard, RwLockReadGuard, Mutex};
 use vec_map::VecMap;
 
 use crate::types::{ArchetypeType, EntityId, ComponentId};
 
+use super::entity_data::EntityData;
+
+const CHUNK_ELEMENTS_COUNT: usize = 64;
+
 pub (crate) trait IComponentsArray where Self: Sync + Send + Debug {
-    fn add_component(&self, idx: usize, component: Box<dyn Any + Sync + Send>);
-    fn get_collection_write_lock(&self) -> Box<dyn Any + Sync + Send>;
-    fn get_collection_read_lock(&self) -> Box<dyn Any + Sync + Send>;
+    fn set_component(&mut self, component: Box<dyn Any + Sync + Send>);
+    fn remove_component(&mut self, position: usize) -> Box<dyn Any + Sync + Send>;
+    fn get_array(&self) -> Arc<dyn Any + Sync + Send>;
 }
 
 #[derive(Debug)]
-pub struct ComponentsArray<TComponent: Clone + Debug + Sync + Send + 'static> {
-    components_collection: RwLock<VecMap<TComponent>>,
+pub struct ComponentsArray<TComponent: Debug + Sync + Send + 'static> {
+    components_collection: Arc<RwLock<Vec<TComponent>>>,
 }
 
-impl<TComponent: Clone + Debug + Sync + Send + 'static> ComponentsArray<TComponent> {
+impl<TComponent: Debug + Sync + Send + 'static> ComponentsArray<TComponent> {
     pub (crate) fn new() -> Self {
         Self {
-            components_collection: RwLock::new(VecMap::<TComponent>::new())
+            components_collection: Arc::new(RwLock::new(Vec::with_capacity(CHUNK_ELEMENTS_COUNT))),
+        }
+    }
+}
+
+impl<TComponent: Debug + Sync + Send + 'static> IComponentsArray for ComponentsArray<TComponent> {
+    fn set_component(&mut self, component: Box<dyn Any + Sync + Send>) {
+        let component = unsafe { *component.downcast_unchecked::<TComponent>() };
+        self.components_collection.blocking_write().push(component);
+    }
+
+    fn remove_component(&mut self, position: usize) -> Box<dyn Any + Sync + Send> {
+        Box::new(self.components_collection.blocking_write().swap_remove(position))
+    }
+
+    fn get_array(&self) -> Arc<dyn Any + Sync + Send> {
+        self.components_collection.clone()
+    }
+}
+
+#[derive(Debug)]
+pub struct ArchetypeChunk {
+    pub (crate) entity_ids: Vec<EntityId>,
+    pub (crate) archetype_components_map: HashMap<ComponentId, Box<dyn IComponentsArray>>,
+    pub (crate) chunk_size: usize,
+    pub (crate) components_count: usize,
+}
+
+impl ArchetypeChunk {
+    pub (crate) fn new(archetype_components_map: HashMap<ComponentId, Box<dyn IComponentsArray>>) -> Self {
+        Self {
+            entity_ids: Vec::with_capacity(CHUNK_ELEMENTS_COUNT),
+            archetype_components_map,
+            chunk_size: CHUNK_ELEMENTS_COUNT,
+            components_count: 0,
         }
     }
 
-    fn get_collection_write_lock(&self) -> RwLockWriteGuard<VecMap<TComponent>> {
-        self.components_collection.blocking_write()
+    pub (crate) fn is_filled(&self) -> bool {
+        self.chunk_size == self.components_count
     }
 
-    fn get_collection_read_lock(&self) -> RwLockReadGuard<VecMap<TComponent>> {
-        self.components_collection.blocking_read()
+    pub (crate) fn is_empty(&self) -> bool {
+        self.components_count == 0
     }
 
-    fn set_component(&self, idx: usize, component: TComponent) {
-        let mut wl = self.get_collection_write_lock();
-        wl.insert(idx, component);
+    pub (crate) fn set_data(&mut self, mut entity_data: EntityData) {
+        self.components_count += 1;
+
+        self.entity_ids.push(entity_data.entity_id);
+
+        self.archetype_components_map.iter_mut().for_each(|(component_id, archetype_component_array)| {
+            archetype_component_array.set_component(entity_data.entity_components.remove(component_id).unwrap())
+        });
     }
 
-    fn get_component(&self, idx: usize) -> TComponent {
-        let rl = self.get_collection_read_lock();
-        let component = rl.get(idx).unwrap();
-        let component = (*component).clone();
-        component
+    pub (crate) fn remove_data(&mut self, position: usize) -> EntityData {
+        self.components_count -= 1;
+
+        let entity_components = self.archetype_components_map.iter_mut().map(|(component_id, archetype_component_array)| -> _ {
+            (*component_id, archetype_component_array.remove_component(position))
+        }).collect::<HashMap<_,_>>();
+
+        let entity_id = self.entity_ids.swap_remove(position);
+
+        EntityData::new(entity_id, entity_components)
+    }
+
+    pub (crate) fn contain_entity(&self, entity_id: &EntityId) -> bool {
+        self.entity_ids.contains(entity_id)
+    }
+
+    pub (crate) fn entity_position(&self, entity_id: &EntityId) -> usize {
+        self.entity_ids.iter().position(|x| *x == *entity_id).unwrap()
+    }
+
+    pub (crate) fn get_components_array(&self, component_id: &ComponentId) -> Option<&Box<dyn IComponentsArray>> {
+        self.archetype_components_map.get(&component_id)
     }
 }
 
-impl<TComponent: Clone + Debug + Sync + Send + 'static> IComponentsArray for ComponentsArray<TComponent> {
-    fn add_component(&self, idx: usize, component: Box<dyn Any + Sync + Send>) {
-        let component: Box<TComponent> = unsafe { component.downcast_unchecked::<TComponent>() };
-        self.get_collection_write_lock().insert(idx, *component);
-    }
+pub trait ArchetypeChunkFabricClosure = Fn() -> ArchetypeChunk;
 
-    fn get_collection_write_lock(&self) -> Box<dyn Any + Sync + Send> {
-        Box::new(self.get_collection_write_lock())
-    }
-
-    fn get_collection_read_lock(&self) -> Box<dyn Any + Sync + Send> {
-        Box::new(self.get_collection_read_lock())
-    }
-}
-
-#[derive(Debug)]
 pub struct Archetype where Self: Sync + Send{
-    archetype_type: ArchetypeType,
-    entity_ids: Vec<EntityId>,
-    archetype_idx: HashMap<ComponentId, usize>,
-    components_collection: Vec<Box<dyn IComponentsArray>>,
+    pub (crate) archetype_type: ArchetypeType,
+    pub (crate) chunks: Vec<ArchetypeChunk>,
+    pub (crate) archetype_chunk_fabric: Box<dyn ArchetypeChunkFabricClosure + Sync + Send>,
+}
+
+impl Debug for Archetype
+where Self: Sync + Send
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Archetype")
+            .field("archetype_type", &self.archetype_type)
+            .field("chunks", &self.chunks)
+            .field("archetype_chunk_fabric", &"closure")
+            .finish()
+    }
 }
 
 impl Archetype where Self: Sync + Send {
-    pub (crate) fn new(archetype_type: ArchetypeType, components_collection: Vec<Box<dyn IComponentsArray>>) -> Self {
-        assert_eq!(archetype_type.len(), components_collection.len());
-
-        let archetype_idx = archetype_type.component_ids.iter().enumerate().map(|(idx, component_id)| {
-            (*component_id, idx)
-        }).collect::<HashMap<_,_>>();
-
+    pub (crate) fn new(archetype_type: ArchetypeType, archetype_chunk_fabric: Box<dyn ArchetypeChunkFabricClosure + Sync + Send>) -> Self {
         Self {
             archetype_type,
-            entity_ids: Default::default(),
-            archetype_idx,
-            components_collection
+            chunks: Default::default(),
+            archetype_chunk_fabric,
         }
     }
 
-    pub fn archetype_type(&self) -> &ArchetypeType {
+    pub  (crate) fn archetype_type(&self) -> &ArchetypeType {
         &self.archetype_type
     }
 
-    pub fn get_component_write_lock(&self, component_id: &ComponentId) -> Box<dyn Any + Sync + Send> {
-        self.components_collection[*self.archetype_idx.get(component_id).unwrap()].get_collection_write_lock()
+    pub (crate) fn add_entity(&mut self, entity_data: EntityData) {
+        assert_eq!(self.archetype_type.components_count(), entity_data.entity_components.len());
+
+        if let Some(last_chunk) = self.chunks.last_mut() {
+            if !last_chunk.is_filled() {
+                last_chunk.set_data(entity_data);
+
+                return;
+            }
+        }
+
+        let mut new_archetype_chunk = (self.archetype_chunk_fabric)();
+        new_archetype_chunk.set_data(entity_data);
+        self.chunks.push(new_archetype_chunk);
     }
 
-    pub fn get_component_read_lock(&self, component_id: &ComponentId) -> Box<dyn Any + Sync + Send> {
-        self.components_collection[*self.archetype_idx.get(component_id).unwrap()].get_collection_read_lock()
+    pub (crate) fn remove_entity(&mut self, entity_id: EntityId) -> EntityData {
+        let chunk_number = self.chunks.iter().position(|x| x.contain_entity(&entity_id)).unwrap();
+
+        let entity_position = self.chunks[chunk_number].entity_position(&entity_id);
+
+        let entity_data = self.chunks[chunk_number].remove_data(entity_position);
+
+        // если чанк после удаления компонентов пуст, значит он последний, т.к. все чанки кроме последнего должны быть полностью заняты
+        if self.chunks[chunk_number].is_empty() {
+            self.chunks.pop();
+
+            return entity_data;
+        }
+
+        let is_tail_chunk = self.chunks.len() == chunk_number + 1;
+
+        // если чанк не последний, для более плотной упаковки перемещаем компоненты из последнего чанка в освободившееся место
+        if !is_tail_chunk {
+            let lust_chunk_number = self.chunks.len() - 1;
+
+            let last_chunk_last_entity_position = self.chunks[lust_chunk_number].components_count - 1;
+            let last_chunk_last_entity_data = self.chunks[lust_chunk_number].remove_data(last_chunk_last_entity_position);
+
+            self.chunks[chunk_number].set_data(last_chunk_last_entity_data);
+
+            // если последний чанк пустой, удаляем его
+            if self.chunks[lust_chunk_number].is_empty() {
+                self.chunks.pop();
+            }
+        }
+
+        entity_data
     }
 
-    pub (crate) fn add_entity(&mut self, entity_id: EntityId, components: Vec<Box<dyn Any + Sync + Send>>) {
-        assert_eq!(self.archetype_type.components_count(), components.len());
-        assert!(!self.entity_ids.contains(&entity_id));
-        
-        self.entity_ids.push(entity_id);
-        let components_idx = self.entity_ids.len() - 1;
+    pub (crate) fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
 
-        let mut components = components;
-        self.components_collection.iter().rev().for_each(|components_array|
-            components_array.add_component(components_idx, components.pop().unwrap())
-        )
+    pub (crate) fn get_chunks(&self) -> Iter<ArchetypeChunk> {
+        self.chunks.iter()
     }
 }
